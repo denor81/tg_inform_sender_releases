@@ -1,0 +1,134 @@
+name: Attest and publish release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact SemVer tag of the existing draft release
+        required: true
+        type: string
+      artifact:
+        description: Exact candidate artifact filename
+        required: true
+        type: string
+      manifest:
+        description: Exact candidate manifest filename
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: notification-sender-publication-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  attest-and-publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production-release
+    steps:
+      - name: Download and validate the draft candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          ARTIFACT: ${{ inputs.artifact }}
+          MANIFEST: ${{ inputs.manifest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/tags/$TAG" ]] || {
+            echo "Workflow ref does not match requested release tag" >&2
+            exit 1
+          }
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]] || {
+            echo "Release tag is not strict SemVer" >&2
+            exit 1
+          }
+          [[ "$ARTIFACT" =~ ^notification-sender-[0-9A-Za-z.-]+-linux-(x86_64|aarch64)\.tar\.gz$ ]]
+          [[ "$MANIFEST" =~ ^notification-sender-[0-9A-Za-z.-]+-linux-(x86_64|aarch64)\.manifest\.json$ ]]
+          [[ "$(gh release view "$TAG" --repo "$RELEASE_REPOSITORY" --json isDraft --jq .isDraft)" == true ]] || {
+            echo "Candidate release must still be a draft" >&2
+            exit 1
+          }
+          mkdir -m 0700 candidate
+          gh release download "$TAG" --repo "$RELEASE_REPOSITORY" \
+            --dir candidate --pattern "$ARTIFACT" --pattern "$MANIFEST"
+          python - "$TAG" "candidate/$ARTIFACT" "candidate/$MANIFEST" <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import sys
+
+          tag, artifact_name, manifest_name = sys.argv[1:]
+          artifact = Path(artifact_name)
+          manifest_path = Path(manifest_name)
+          if not artifact.is_file() or artifact.stat().st_size > 256 * 1024 * 1024:
+              raise SystemExit("artifact is missing or too large")
+          if not manifest_path.is_file() or manifest_path.stat().st_size > 256 * 1024:
+              raise SystemExit("manifest is missing or too large")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          expected_version = tag.removeprefix("v")
+          expected = {
+              "application": "notification-sender",
+              "format": 1,
+              "tag": tag,
+              "version": expected_version,
+          }
+          for key, value in expected.items():
+              if manifest.get(key) != value:
+                  raise SystemExit(f"manifest {key} does not match the release")
+          source = manifest.get("source")
+          if not isinstance(source, dict) or source.get("tag") != tag:
+              raise SystemExit("manifest source tag does not match")
+          if source.get("repository") != "denor81/tg_inform_sender":
+              raise SystemExit("manifest source repository is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40}", str(source.get("commit", ""))):
+              raise SystemExit("manifest source commit is invalid")
+          release_artifact = manifest.get("artifact")
+          if not isinstance(release_artifact, dict) or release_artifact.get("name") != artifact.name:
+              raise SystemExit("manifest artifact name does not match")
+          digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+          if release_artifact.get("sha256") != digest:
+              raise SystemExit("artifact SHA256 does not match manifest")
+          if release_artifact.get("size") != artifact.stat().st_size:
+              raise SystemExit("artifact size does not match manifest")
+          print(f"Validated draft {tag} from private source {source['commit']}")
+          PY
+
+      - name: Create GitHub Sigstore provenance
+        id: attest
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: |
+            candidate/${{ inputs.artifact }}
+            candidate/${{ inputs.manifest }}
+          show-summary: true
+
+      - name: Attach attestation bundle and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          ARTIFACT: ${{ inputs.artifact }}
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="candidate/${ARTIFACT}.bundle.jsonl"
+          cp -- "$BUNDLE_PATH" "$bundle"
+          gh release upload "$TAG" "$bundle" --repo "$RELEASE_REPOSITORY"
+          if [[ "$TAG" == *-* ]]; then
+            gh release edit "$TAG" --repo "$RELEASE_REPOSITORY" --draft=false --prerelease
+          else
+            gh release edit "$TAG" --repo "$RELEASE_REPOSITORY" --draft=false --latest
+          fi
